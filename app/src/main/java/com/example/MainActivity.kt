@@ -11,7 +11,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.ui.screens.SpendlyDashboard
-import com.example.ui.theme.MyApplicationTheme
+import com.example.ui.theme.SpendlyTheme
 import com.example.ui.viewmodel.FinanceViewModel
 
 class MainActivity : ComponentActivity() {
@@ -21,7 +21,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val viewModel: FinanceViewModel = viewModel()
             val isDarkTheme by viewModel.isDarkTheme.collectAsStateWithLifecycle()
-            MyApplicationTheme(darkTheme = isDarkTheme) { // Dynamic theme choice
+            SpendlyTheme(darkTheme = isDarkTheme) { // Dynamic theme choice
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = androidx.compose.material3.MaterialTheme.colorScheme.background

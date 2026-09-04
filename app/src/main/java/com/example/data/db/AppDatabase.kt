@@ -18,7 +18,7 @@ import com.example.data.model.BillReminder
         SavingGoal::class,
         BillReminder::class
     ],
-    version = 1,
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {

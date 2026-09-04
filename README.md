@@ -11,7 +11,8 @@ Spendly is a native Android application designed for personal and shared finance
 * **Savings Vaults**: Set financial target goals and visually track deposits and progress bars towards completion.
 * **Upcoming Bill Reminders**: Track utility and subscription payments with due-date listings, togglable payment statuses, and alert simulations.
 * **Dynamic Currency Conversion**: Instantly switch the active currency between INR, USD, and EUR, converting all dashboards and reports using real-time mock exchange rates.
-* **Financial Analytics**: View graphical reports of category spending distributions and member contributions.
+* **Financial Analytics & 50/30/20 Essentials Rule**: View graphical reports of category spending distributions, member contributions, and a dedicated 50/30/20 breakdown (50% Needs/Essentials, 30% Wants/Discretionary, 20% Savings) with real-time balance indicators.
+* **Essentials vs. Wants Tagging**: Mark expenses as essential needs (Rent, Food, Utilities, Healthcare) or discretionary wants right from the transaction dialog, tagged with clean indicators in the ledger.
 
 ---
 

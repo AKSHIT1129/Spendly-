@@ -12,6 +12,9 @@ import com.example.data.model.BillReminder
 import com.example.data.repository.FinanceRepository
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 data class AppNotification(
@@ -21,9 +24,30 @@ data class AppNotification(
     val isRead: Boolean = false
 )
 
+data class EssentialsRatioBreakdown(
+    val totalIncome: Double,
+    val totalExpense: Double,
+    val essentialExpense: Double,
+    val discretionaryExpense: Double,
+    val savings: Double,
+    val essentialPercent: Float,
+    val discretionaryPercent: Float,
+    val savingsPercent: Float
+)
+
 class FinanceViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository: FinanceRepository
+    
+    private val sharedPrefs = application.getSharedPreferences("spendly_prefs", android.content.Context.MODE_PRIVATE)
+    
+    private val _showOnboarding = MutableStateFlow(!sharedPrefs.getBoolean("onboarding_completed", false))
+    val showOnboarding = _showOnboarding.asStateFlow()
+    
+    fun completeOnboarding() {
+        sharedPrefs.edit().putBoolean("onboarding_completed", true).apply()
+        _showOnboarding.value = false
+    }
 
     // Native reactive StateFlows from database
     val members: StateFlow<List<Member>>
@@ -61,29 +85,55 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     private val _currency = MutableStateFlow("INR")
     val currency = _currency.asStateFlow()
 
-    val currencySymbol = flowOf("₹").stateIn(
+    val currencySymbol = _currency.map { cur ->
+        when (cur) {
+            "USD" -> "$"
+            "EUR" -> "€"
+            else -> "₹"
+        }
+    }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.Eagerly,
         initialValue = "₹"
     )
 
-    val currencyRate = flowOf(1.0).stateIn(
+    private val _exchangeRates = MutableStateFlow<Map<String, Double>>(
+        mapOf(
+            "USD" to 1.0 / 95.85,
+            "EUR" to 1.0 / 111.49,
+            "INR" to 1.0
+        )
+    )
+    val exchangeRates = _exchangeRates.asStateFlow()
+
+    val currencyRate = combine(_currency, _exchangeRates) { cur, rates ->
+        rates[cur] ?: when (cur) {
+            "USD" -> 1.0 / 95.85
+            "EUR" -> 1.0 / 111.49
+            else -> 1.0
+        }
+    }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.Eagerly,
         initialValue = 1.0
     )
 
     fun setCurrency(newCurrency: String) {
-        // Only Rupees supported
+        _currency.value = newCurrency
+        showInAppNotification("💱 Currency converted to $newCurrency!")
     }
 
     fun getCurrencySymbol(): String {
-        return "₹"
+        return when (_currency.value) {
+            "USD" -> "$"
+            "EUR" -> "€"
+            else -> "₹"
+        }
     }
 
     init {
         val database = AppDatabase.getDatabase(application)
-        repository = FinanceRepository(database.financeDao())
+        repository = FinanceRepository(database.financeDao(), application)
 
         members = repository.allMembers.stateIn(
             scope = viewModelScope,
@@ -115,18 +165,22 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
             initialValue = emptyList()
         )
 
-        // Seed default starter data if database is empty
-        viewModelScope.launch {
-            val currentMembers = repository.allMembers.first()
-            if (currentMembers.isEmpty()) {
-                seedDatabase()
+        // Seed default starter data if database is empty only if onboarding is completed
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val onboardingCompleted = sharedPrefs.getBoolean("onboarding_completed", false)
+            if (onboardingCompleted) {
+                val currentMembers = repository.allMembers.first()
+                if (currentMembers.isEmpty()) {
+                    seedDatabase("You")
+                }
             }
         }
+        fetchLiveExchangeRates()
     }
 
-    private suspend fun seedDatabase() {
+    private suspend fun seedDatabase(primaryName: String) {
         // Create 3 initial members (including Primary)
-        val m1 = Member(name = "You", colorHex = "#10B981", role = "Primary")
+        val m1 = Member(name = primaryName, colorHex = "#10B981", role = "Primary")
         val m2 = Member(name = "Sarah", colorHex = "#6366F1", role = "Partner")
         val m3 = Member(name = "Akshit", colorHex = "#EC4899", role = "Family")
 
@@ -135,11 +189,12 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         repository.insertMember(m3)
 
         // Add pre-configured category budgets
-        repository.insertBudget(Budget(category = "Food", monthlyLimit = 15000.0, monthYear = "2026-05"))
-        repository.insertBudget(Budget(category = "Rent", monthlyLimit = 40000.0, monthYear = "2026-05"))
-        repository.insertBudget(Budget(category = "Shopping", monthlyLimit = 12000.0, monthYear = "2026-05"))
-        repository.insertBudget(Budget(category = "Entertainment", monthlyLimit = 6000.0, monthYear = "2026-05"))
-        repository.insertBudget(Budget(category = "Utilities", monthlyLimit = 8000.0, monthYear = "2026-05"))
+        val curMonth = getCurrentYearMonth()
+        repository.insertBudget(Budget(category = "Food", monthlyLimit = 15000.0, monthYear = curMonth))
+        repository.insertBudget(Budget(category = "Rent", monthlyLimit = 40000.0, monthYear = curMonth))
+        repository.insertBudget(Budget(category = "Shopping", monthlyLimit = 12000.0, monthYear = curMonth))
+        repository.insertBudget(Budget(category = "Entertainment", monthlyLimit = 6000.0, monthYear = curMonth))
+        repository.insertBudget(Budget(category = "Utilities", monthlyLimit = 8000.0, monthYear = curMonth))
 
         // Add Saving Goals
         repository.insertSavingGoal(SavingGoal(title = "Emergency Fund", targetAmount = 250000.0, currentAmount = 100000.0, targetDate = "Dec 2026"))
@@ -153,13 +208,38 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
 
         // Add initial structured ledger transactions (seeding 1-based member IDs)
         // Note: First inserted members will get autogenerated IDs 1, 2, 3 in order
-        repository.insertTransaction(Transaction(amount = 120000.0, category = "Salary", description = "Tech Corp Monthly Base", date = now - 5 * 24 * 60 * 60 * 1000, memberId = 1, isShared = false))
-        repository.insertTransaction(Transaction(amount = -35000.0, category = "Rent", description = "Monthly Apart. Base", date = now - 4 * 24 * 60 * 60 * 1000, memberId = 1, isShared = true))
-        repository.insertTransaction(Transaction(amount = -3500.50, category = "Food", description = "Whole Foods Organic Groceries", date = now - 3 * 24 * 60 * 60 * 1000, memberId = 2, isShared = true))
-        repository.insertTransaction(Transaction(amount = -850.00, category = "Entertainment", description = "Cinema Standard Tickets", date = now - 2 * 24 * 60 * 60 * 1000, memberId = 3, isShared = true))
-        repository.insertTransaction(Transaction(amount = -2500.00, category = "Shopping", description = "Winter Warm Jacket", date = now - 1 * 24 * 60 * 60 * 1000, memberId = 2, isShared = false))
-        repository.insertTransaction(Transaction(amount = -1800.00, category = "Utilities", description = "Clean water & Power bill", date = now - 8 * 60 * 60 * 1000, memberId = 1, isShared = true))
-        repository.insertTransaction(Transaction(amount = 15000.0, category = "Salary", description = "Mobile Consulting Freelance", date = now - 2 * 60 * 60 * 1000, memberId = 1, isShared = false))
+        repository.insertTransaction(Transaction(amount = 120000.0, category = "Salary", description = "$primaryName Monthly Base", date = now - 5 * 24 * 60 * 60 * 1000, memberId = 1, isShared = false, isEssential = false))
+        repository.insertTransaction(Transaction(amount = -35000.0, category = "Rent", description = "Monthly Apart. Base", date = now - 4 * 24 * 60 * 60 * 1000, memberId = 1, isShared = true, isEssential = true))
+        repository.insertTransaction(Transaction(amount = -3500.50, category = "Food", description = "Whole Foods Organic Groceries", date = now - 3 * 24 * 60 * 60 * 1000, memberId = 2, isShared = true, isEssential = true))
+        repository.insertTransaction(Transaction(amount = -850.00, category = "Entertainment", description = "Cinema Standard Tickets", date = now - 2 * 24 * 60 * 60 * 1000, memberId = 3, isShared = true, isEssential = false))
+        repository.insertTransaction(Transaction(amount = -2500.00, category = "Shopping", description = "Winter Warm Jacket", date = now - 1 * 24 * 60 * 60 * 1000, memberId = 2, isShared = false, isEssential = false))
+        repository.insertTransaction(Transaction(amount = -1800.00, category = "Utilities", description = "Clean water & Power bill", date = now - 8 * 60 * 60 * 1000, memberId = 1, isShared = true, isEssential = true))
+        repository.insertTransaction(Transaction(amount = 15000.0, category = "Salary", description = "Mobile Consulting Freelance", date = now - 2 * 60 * 60 * 1000, memberId = 1, isShared = false, isEssential = false))
+    }
+
+    fun setupPrimaryProfile(name: String, targetGoalTitle: String?, targetGoalAmount: Double?) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val resolvedName = if (name.isBlank()) "You" else name.trim()
+            
+            // Seed database using the resolved user's name
+            seedDatabase(resolvedName)
+            
+            // Insert custom saving goal if provided
+            if (!targetGoalTitle.isNullOrBlank() && targetGoalAmount != null && targetGoalAmount > 0.0) {
+                val rate = currencyRate.value
+                val baseTarget = targetGoalAmount / rate
+                val cap = SavingGoal(
+                    title = targetGoalTitle.trim(),
+                    targetAmount = baseTarget,
+                    currentAmount = 0.0,
+                    targetDate = "Dec 2026"
+                )
+                repository.insertSavingGoal(cap)
+            }
+            
+            // Complete onboarding setup and hide state
+            completeOnboarding()
+        }
     }
 
     // --- Member Interface ---
@@ -191,20 +271,30 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // --- Transaction Interface ---
-    fun addTransaction(amount: Double, category: String, description: String, memberId: Int, isShared: Boolean) {
+    fun addTransaction(
+        amount: Double,
+        category: String,
+        description: String,
+        memberId: Int,
+        isShared: Boolean,
+        isEssential: Boolean = isCategoryEssentialByDefault(category)
+    ) {
         viewModelScope.launch {
+            val rate = currencyRate.value
+            val baseAmount = amount / rate
             val tx = Transaction(
-                amount = amount,
+                amount = baseAmount,
                 category = category,
                 description = description,
                 date = System.currentTimeMillis(),
                 memberId = memberId,
-                isShared = isShared
+                isShared = isShared,
+                isEssential = isEssential
             )
             repository.insertTransaction(tx)
 
             // Trigger proactive notification checking if they crossed a budget
-            checkBudgetsForCrossing(category, amount)
+            checkBudgetsForCrossing(category, baseAmount)
 
             showInAppNotification(
                 if (amount > 0) "💰 Streamed revenue input: +${getCurrencySymbol()}${String.format("%.2f", amount)}"
@@ -218,19 +308,33 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         val expenseVal = -amount
 
         viewModelScope.launch {
-            // Find active budget limits for that category
+            val currentMonth = getCurrentYearMonth()
+            // Find active budget limits for that category for the current month
             val budgetList = budgets.value
-            val targetBudget = budgetList.find { it.category.equals(category, ignoreCase = true) } ?: return@launch
+            val targetBudget = budgetList.find { 
+                it.category.equals(category, ignoreCase = true) && it.monthYear == currentMonth 
+            } ?: return@launch
 
-            // Compute current aggregate spent
+            // Compute current aggregate spent for the current month
             val allTx = transactions.value
             val currentSpent = allTx
-                .filter { it.category.equals(category, ignoreCase = true) && it.amount < 0 }
+                .filter { 
+                    it.category.equals(category, ignoreCase = true) && 
+                    it.amount < 0 && 
+                    isTimestampInMonth(it.date, currentMonth)
+                }
                 .sumOf { -it.amount }
 
             val projectedSpent = currentSpent + expenseVal
-            if (projectedSpent > targetBudget.monthlyLimit) {
+            val previousRatio = if (targetBudget.monthlyLimit > 0) currentSpent / targetBudget.monthlyLimit else 0.0
+            val newRatio = if (targetBudget.monthlyLimit > 0) projectedSpent / targetBudget.monthlyLimit else 0.0
+
+            if (projectedSpent > targetBudget.monthlyLimit && previousRatio <= 1.0) {
                 showInAppNotification("⚠️ Budget Alert: Limit of ${getCurrencySymbol()}${String.format("%.2f", targetBudget.monthlyLimit)} exceeded for '$category' category!")
+            } else if (newRatio >= 0.9 && previousRatio < 0.9) {
+                showInAppNotification("⚠️ Warning: Spend has reached ${String.format("%.0f", newRatio * 100)}% of your monthly budget limit for '$category'!")
+            } else if (newRatio >= 0.8 && previousRatio < 0.8) {
+                showInAppNotification("⚠️ Notice: Spend has reached ${String.format("%.0f", newRatio * 100)}% of your monthly budget limit for '$category'!")
             }
         }
     }
@@ -245,7 +349,8 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     // --- Budget Interface ---
     fun addBudget(category: String, limit: Double) {
         viewModelScope.launch {
-            repository.insertBudget(Budget(category = category, monthlyLimit = limit, monthYear = "2026-05"))
+            val baseLimit = limit / currencyRate.value
+            repository.insertBudget(Budget(category = category, monthlyLimit = baseLimit, monthYear = getCurrentYearMonth()))
             showInAppNotification("📊 Created monthly budget limit of ${getCurrencySymbol()}${limit} for $category.")
         }
     }
@@ -260,7 +365,9 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     // --- Saving Goals Interface ---
     fun addSavingGoal(title: String, targetAmount: Double, currentAmount: Double, targetDate: String) {
         viewModelScope.launch {
-            val goal = SavingGoal(title = title, targetAmount = targetAmount, currentAmount = currentAmount, targetDate = targetDate)
+            val baseTarget = targetAmount / currencyRate.value
+            val baseCurrent = currentAmount / currencyRate.value
+            val goal = SavingGoal(title = title, targetAmount = baseTarget, currentAmount = baseCurrent, targetDate = targetDate)
             repository.insertSavingGoal(goal)
             showInAppNotification("🎯 Launched saving goal: '$title' to secure ${getCurrencySymbol()}${targetAmount}!")
         }
@@ -268,15 +375,19 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateSavingProgress(goal: SavingGoal, addAmount: Double) {
         viewModelScope.launch {
+            val rate = currencyRate.value
+            val baseAddAmount = addAmount / rate
             val dbGoal = repository.allSavingGoals.first().find { it.id == goal.id } ?: goal
-            val updatedAmount = (dbGoal.currentAmount + addAmount).coerceIn(0.0, dbGoal.targetAmount)
+            val updatedAmount = (dbGoal.currentAmount + baseAddAmount).coerceIn(0.0, dbGoal.targetAmount)
             val updatedGoal = dbGoal.copy(currentAmount = updatedAmount)
             repository.insertSavingGoal(updatedGoal)
 
+            val activeTarget = dbGoal.targetAmount * rate
+            val activeUpdated = updatedAmount * rate
             if (updatedAmount >= dbGoal.targetAmount) {
-                showInAppNotification("🏆 Target Reached! Saved ${getCurrencySymbol()}${String.format("%.2f", dbGoal.targetAmount)} for '${dbGoal.title}'!")
+                showInAppNotification("🏆 Target Reached! Saved ${getCurrencySymbol()}${String.format("%.2f", activeTarget)} for '${dbGoal.title}'!")
             } else {
-                showInAppNotification("💰 Seeded ${getCurrencySymbol()}${addAmount} to '${dbGoal.title}'. Saved: ${getCurrencySymbol()}${String.format("%.2f", updatedAmount)}/${getCurrencySymbol()}${String.format("%.2f", dbGoal.targetAmount)}")
+                showInAppNotification("💰 Seeded ${getCurrencySymbol()}${addAmount} to '${dbGoal.title}'. Saved: ${getCurrencySymbol()}${String.format("%.2f", activeUpdated)}/${getCurrencySymbol()}${String.format("%.2f", activeTarget)}")
             }
         }
     }
@@ -291,7 +402,8 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
     // --- Bill Reminders Interface ---
     fun addBillReminder(title: String, amount: Double, dueDate: Long, category: String) {
         viewModelScope.launch {
-            val bill = BillReminder(title = title, amount = amount, dueDate = dueDate, isPaid = false, category = category)
+            val baseAmount = amount / currencyRate.value
+            val bill = BillReminder(title = title, amount = baseAmount, dueDate = dueDate, isPaid = false, category = category)
             repository.insertBillReminder(bill)
             showInAppNotification("📅 Calendar bill scheduled: '$title' (${getCurrencySymbol()}${amount})")
         }
@@ -317,6 +429,13 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun clearAllData() {
+        viewModelScope.launch {
+            repository.clearAllFinancialData()
+            showInAppNotification("🧹 Complete Wipeout: Clear all database records successfully!")
+        }
+    }
+
     // --- Common Notification alert Banner logic ---
     fun showInAppNotification(message: String) {
         viewModelScope.launch {
@@ -328,5 +447,80 @@ class FinanceViewModel(application: Application) : AndroidViewModel(application)
 
     fun dismissNotification() {
         _notification.value = null
+    }
+
+    fun getCurrentYearMonth(): String {
+        val sdf = SimpleDateFormat("yyyy-MM", Locale.getDefault())
+        return sdf.format(Date())
+    }
+
+    fun isTimestampInMonth(timestamp: Long, monthYear: String): Boolean {
+        val sdf = SimpleDateFormat("yyyy-MM", Locale.getDefault())
+        return sdf.format(Date(timestamp)) == monthYear
+    }
+
+    fun isCategoryEssentialByDefault(category: String): Boolean {
+        return when (category.trim().lowercase(Locale.getDefault())) {
+            "rent", "food", "groceries", "utilities", "bills", "healthcare", "medical", "insurance", "transport", "emi", "education" -> true
+            else -> false
+        }
+    }
+
+    fun getEssentialsBreakdown(monthYear: String? = getCurrentYearMonth()): EssentialsRatioBreakdown {
+        val txs = transactions.value.filter {
+            if (monthYear != null) isTimestampInMonth(it.date, monthYear) else true
+        }
+        val income = txs.filter { it.amount > 0 }.sumOf { it.amount }
+        val expenseTxs = txs.filter { it.amount < 0 }
+        val totalExpense = expenseTxs.sumOf { -it.amount }
+        val essential = expenseTxs.filter { it.isEssential || isCategoryEssentialByDefault(it.category) }.sumOf { -it.amount }
+        val discretionary = (totalExpense - essential).coerceAtLeast(0.0)
+        val savings = (income - totalExpense).coerceAtLeast(0.0)
+        val baseForPercent = if (income > 0) income else totalExpense.coerceAtLeast(1.0)
+        val essentialPct = ((essential / baseForPercent) * 100).toFloat().coerceIn(0f, 100f)
+        val discretionaryPct = ((discretionary / baseForPercent) * 100).toFloat().coerceIn(0f, 100f)
+        val savingsPct = ((savings / baseForPercent) * 100).toFloat().coerceIn(0f, 100f)
+
+        return EssentialsRatioBreakdown(
+            totalIncome = income,
+            totalExpense = totalExpense,
+            essentialExpense = essential,
+            discretionaryExpense = discretionary,
+            savings = savings,
+            essentialPercent = essentialPct,
+            discretionaryPercent = discretionaryPct,
+            savingsPercent = savingsPct
+        )
+    }
+
+    private fun fetchLiveExchangeRates() {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val moshi = com.squareup.moshi.Moshi.Builder()
+                    .add(com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory())
+                    .build()
+                val retrofit = retrofit2.Retrofit.Builder()
+                    .baseUrl("https://open.er-api.com/")
+                    .addConverterFactory(retrofit2.converter.moshi.MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(com.example.data.api.CurrencyApi::class.java)
+                val response = api.getLatestRates()
+                if (response.result == "success" && response.rates.isNotEmpty()) {
+                    val usd = response.rates["USD"]
+                    val eur = response.rates["EUR"]
+                    val inr = response.rates["INR"] ?: 1.0
+                    if (usd != null && eur != null) {
+                        _exchangeRates.value = mapOf(
+                            "USD" to usd,
+                            "EUR" to eur,
+                            "INR" to inr
+                        )
+                        android.util.Log.d("FinanceViewModel", "Live rates fetched: USD $usd, EUR $eur")
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("FinanceViewModel", "Failed to fetch live exchange rates, falling back to static config", e)
+            }
+        }
     }
 }

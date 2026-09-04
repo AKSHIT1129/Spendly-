@@ -67,4 +67,16 @@ interface FinanceDao {
 
     @Delete
     suspend fun deleteBillReminder(bill: BillReminder)
+
+    @Query("DELETE FROM transactions")
+    suspend fun clearTransactions()
+
+    @Query("DELETE FROM budgets")
+    suspend fun clearBudgets()
+
+    @Query("DELETE FROM saving_goals")
+    suspend fun clearSavingGoals()
+
+    @Query("DELETE FROM bill_reminders")
+    suspend fun clearBillReminders()
 }
